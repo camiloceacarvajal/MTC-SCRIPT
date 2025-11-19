@@ -87,6 +87,7 @@ PERSONAL_CATASTRO = [
     {"nombre": "Camilo Cea Carvajal", "cargo": "Analista de Estudios Territoriales", "region": "Nivel Central"},
     {"nombre": "Gloria Inzunza Rivera", "cargo": "Encargada de Estudios Territoriales", "region": "Nivel Central"},
 ]
+
 # ==========================================
 # 2. UTILIDADES
 # ==========================================
@@ -98,45 +99,71 @@ def norm(s):
             if not unicodedata.combining(c)
         )
     ).strip()
+
 def es_basemap(layer):
+    if not layer.isValid(): return False
     n = norm(layer.name())
     if layer.type() != QgsMapLayer.VectorLayer:
         return True
     return any(k in n for k in ["google","satellite","natgeo","xyz","wms","osm","world map","basemap"])
+
 def get_layer_dir(layer):
     try:
         src = layer.dataProvider().dataSourceUri()
+        if "|layername=" in src: src = src.split("|layername=")[0]
+        if os.path.isfile(src): return os.path.dirname(src)
+        m = re.search(r"([A-Za-z]:[\\/].+?\.(gpkg|shp|geojson|sqlite))", src)
+        if m and os.path.isfile(m.group(1)): return os.path.dirname(m.group(1))
     except:
-        src = getattr(layer,"source",lambda:"")()
-    if "|layername=" in src: src = src.split("|layername=")[0]
-    if os.path.isfile(src): return os.path.dirname(src)
-    m = re.search(r"([A-Za-z]:[\\/].+?\.(gpkg|shp|geojson|sqlite))", src)
-    if m and os.path.isfile(m.group(1)): return os.path.dirname(m.group(1))
+        pass
     return None
+
+def get_save_dir(layer):
+    """Determina la ruta de guardado del HTML."""
+    # 1. Donde está la capa
+    path = get_layer_dir(layer)
+    if path and os.path.isdir(path): return path
+    # 2. Donde está el proyecto
+    proj_path = QgsProject.instance().fileName()
+    if proj_path and os.path.isfile(proj_path): return os.path.dirname(proj_path)
+    # 3. Usuario
+    return os.path.expanduser("~")
+
 # ==========================================
 # 3. DETECCIÓN DE CAPA BASE
 # ==========================================
 def detectar_capa_base():
+    print("--- Iniciando detección de capa base ---")
     root = QgsProject.instance().layerTreeRoot()
     grupo = root.findGroup("Deslinde MCT")
+    
     if not grupo: 
-        iface.messageBar().pushMessage("Error", "No se encontró el grupo 'Deslinde MCT'", level=Qgis.Critical)
+        msg = "No se encontró el grupo 'Deslinde MCT' en el panel de capas."
+        iface.messageBar().pushMessage("Error de Estructura", msg, level=Qgis.Critical)
+        print(f"[ERROR] {msg}")
         return None
-    candidatos=[]
+    
+    candidatos = []
     for node in grupo.children():
         if isinstance(node, QgsLayerTreeLayer):
-            lyr=node.layer()
-            if lyr and lyr.isValid() and lyr.type()==QgsMapLayer.VectorLayer and lyr.geometryType()==2:
-                try:
-                    fc=lyr.featureCount()
-                except:
-                    fc=9999
-                candidatos.append((fc,lyr))
+            lyr = node.layer()
+            if lyr and lyr.isValid():
+                # Validar que sea polígono (GeometryType 2)
+                if lyr.type() == QgsMapLayer.VectorLayer and lyr.geometryType() == 2:
+                    try: fc = lyr.featureCount()
+                    except: fc = 9999
+                    candidatos.append((fc, lyr))
+    
     if not candidatos:
-        iface.messageBar().pushMessage("Error", "No se encontraron capas de polígono válidas en 'Deslinde MCT'", level=Qgis.Critical)
+        msg = "El grupo 'Deslinde MCT' existe, pero no contiene capas de POLÍGONO válidas."
+        iface.messageBar().pushMessage("Error de Capa", msg, level=Qgis.Critical)
+        print(f"[ERROR] {msg}")
         return None
-    candidatos.sort(key=lambda x:x[0])
+    
+    candidatos.sort(key=lambda x: x[0])
+    print(f"✅ Capa base seleccionada: {candidatos[0][1].name()}")
     return candidatos[0][1]
+
 def obtener_identificacion(capa_base):
     region=provincia=comuna="(No identificado)"
     root = QgsProject.instance().layerTreeRoot()
@@ -156,13 +183,15 @@ def obtener_identificacion(capa_base):
                             region=f["REGION"] if "REGION" in fn else region
                             provincia=f["PROVINCIA"] if "PROVINCIA" in fn else provincia
                             comuna=f["COMUNA"] if "COMUNA" in fn else comuna
+                        # Limpiar selección para no ensuciar mapa
+                        comunas_layer.removeSelection() 
                     except:
                         pass
     return region, provincia, comuna
 
+# ==========================================
 # 4. CONSTRUIR TABLAS
-
-# --- FUNCIÓN MODIFICADA (1) ---
+# ==========================================
 def clasificar_capas(capa_base):
     root = QgsProject.instance().layerTreeRoot()
     clasificados = OrderedDict()
@@ -170,54 +199,34 @@ def clasificar_capas(capa_base):
     capa_base_dissolved = None
     if capa_base and capa_base.isValid():
         try:
-            result = processing.run("native:dissolve", {
-                'INPUT': capa_base,
-                'OUTPUT': 'memory:'
-            })
+            result = processing.run("native:dissolve", {'INPUT': capa_base, 'OUTPUT': 'memory:'})
             capa_base_dissolved = result['OUTPUT']
-        except Exception as e:
-            print(f"Advertencia: No se pudo disolver la capa base. El chequeo espacial para G.00 puede fallar. {e}")
-            pass
+        except: pass
 
     for group in root.children():
-        if not isinstance(group, QgsLayerTreeGroup): 
-            continue
-        if not re.match(r"^\s*\d{2}\.", group.name()):
-            continue
+        if not isinstance(group, QgsLayerTreeGroup): continue
+        if not re.match(r"^\s*\d{2}\.", group.name()): continue
             
         gname = group.name()
         clasificados[gname] = []
         
         for node in group.children():
-            if not isinstance(node, QgsLayerTreeLayer): 
-                continue
+            if not isinstance(node, QgsLayerTreeLayer): continue
             lyr=node.layer()
-            if not lyr or not lyr.isValid() or es_basemap(lyr): 
-                continue
+            if not lyr or not lyr.isValid() or es_basemap(lyr): continue
             
-            condicion = "No superpone" # Default
+            condicion = "No superpone"
 
-            # --- NUEVA LÓGICA DE INTERSECCIÓN ---
             if gname.startswith("00.") and capa_base_dissolved:
-                # Para el grupo 00, hacer chequeo espacial real
                 try:
                     extract = processing.run("native:extractbylocation", {
-                        'INPUT': lyr,
-                        'INTERSECT': capa_base_dissolved,
-                        'PREDICATE': [0], # 0 = intersects
-                        'OUTPUT': 'memory:'
+                        'INPUT': lyr, 'INTERSECT': capa_base_dissolved,
+                        'PREDICATE': [0], 'OUTPUT': 'memory:'
                     })
-                    if extract['OUTPUT'].featureCount() > 0:
-                        condicion = "Superpone"
-                    else:
-                        condicion = "No superpone"
-                except Exception as e:
-                    print(f"Error chequeando intersección para {lyr.name()}: {e}")
-                    condicion = "No superpone" # Fallback
+                    if extract['OUTPUT'].featureCount() > 0: condicion = "Superpone"
+                except: pass
             else:
-                # Para todos los demás grupos, usar la visibilidad
                 condicion = "Superpone" if node.isVisible() else "No superpone"
-            # --- FIN DE LA LÓGICA ---
             
             clasificados[gname].append((lyr.name(),condicion))
     return clasificados
@@ -242,13 +251,11 @@ def build_data(capa_base):
         "fuente_geo": PARAMS_TECNICOS.get("fuente_geo", "")
     }
     return DATA
-# --- FUNCIÓN MODIFICADA (2) ---
+
 def construir_tabla_matriz(clasificados):
     rows = []
     for g, items in clasificados.items():
-        if not items:
-            continue
-            
+        if not items: continue
         has_superpone = any(cond == "Superpone" for _, cond in items)
         is_open = (g.startswith("01.") or g.startswith("00.")) or has_superpone
         
@@ -256,7 +263,6 @@ def construir_tabla_matriz(clasificados):
         indicator = "[-]" if is_open else "[+]"
         sorted_items = sorted(items, key=lambda x: (x[1] != "Superpone", norm(x[0])))
         rowspan = len(sorted_items)
-        
         rowspan_actual = rowspan if is_open else 1
         style_filas_ocultas = "" if is_open else "style='display:none;'"
         style_celdas_fila1_ocultas = "" if is_open else "style='display:none;'"
@@ -267,51 +273,24 @@ def construir_tabla_matriz(clasificados):
             texto_condicion = f"{icon} {cond}" if icon else cond
 
             if i == 1:
-                # Modificación: El onclick se mueve al span y se añade event.stopPropagation()
-                gcell = f"<td rowspan='{rowspan_actual}' class='cat' id='cat-{data_g_norm}' " \
-                        f"data-full-rowspan='{rowspan}'>" \
-                        f"{g} <span class='toggle-indicator' id='toggle-{data_g_norm}' " \
-                        f"onclick='event.stopPropagation(); toggleGroup(\"{data_g_norm}\")'>{indicator}</span></td>"
-                
-                # Las celdas de datos de la fila 1 (se ocultan si está cerrado)
-                data_cells = f"<td {style_celdas_fila1_ocultas}>{i}</td>" \
-                             f"<td {style_celdas_fila1_ocultas}>{nombre}</td>" \
-                             f"<td {style_celdas_fila1_ocultas} style='background:{color}; white-space:nowrap;'>{texto_condicion}</td>"
-                
-                rows.append(
-                    f"<tr data-grupo='{data_g_norm}'>"
-                    f"{gcell}"
-                    f"{data_cells}"
-                    f"</tr>"
-                )
+                gcell = f"<td rowspan='{rowspan_actual}' class='cat' id='cat-{data_g_norm}' data-full-rowspan='{rowspan}'>{g} <span class='toggle-indicator' id='toggle-{data_g_norm}' onclick='event.stopPropagation(); toggleGroup(\"{data_g_norm}\")'>{indicator}</span></td>"
+                data_cells = f"<td {style_celdas_fila1_ocultas}>{i}</td><td {style_celdas_fila1_ocultas}>{nombre}</td><td {style_celdas_fila1_ocultas} style='background:{color}; white-space:nowrap;'>{texto_condicion}</td>"
+                rows.append(f"<tr data-grupo='{data_g_norm}'>{gcell}{data_cells}</tr>")
             else:
-                # Filas 2 en adelante
-                gcell = ""
-                data_cells = f"<td>{i}</td>" \
-                             f"<td>{nombre}</td>" \
-                             f"<td style='background:{color}; white-space:nowrap;'>{texto_condicion}</td>"
-                
-                rows.append(
-                    f"<tr data-grupo='{data_g_norm}' {style_filas_ocultas}>"
-                    f"{gcell}"
-                    f"{data_cells}"
-                    f"</tr>"
-                )
+                data_cells = f"<td>{i}</td><td>{nombre}</td><td style='background:{color}; white-space:nowrap;'>{texto_condicion}</td>"
+                rows.append(f"<tr data-grupo='{data_g_norm}' {style_filas_ocultas}>{data_cells}</tr>")
     return "".join(rows)
+
 # ==========================================
 # 5. HTML (plantilla + ensamblado)
 # ==========================================
 def build_html(DATA, tabla_resumen, tabla_matriz):
     region_detectada = DATA.get("region", "(No identificado)")
-    
-    # Obtener Comuna y Provincia con valores por defecto
     comuna_detectada = DATA.get("comuna", "[comuna]")
     provincia_detectada = DATA.get("provincia", "[provincia]")
 
-    if comuna_detectada != "[comuna]" and comuna_detectada != "(No identificado)":
-        comuna_detectada = comuna_detectada.title()
-    if provincia_detectada != "[provincia]" and provincia_detectada != "(No identificado)":
-        provincia_detectada = provincia_detectada.title()
+    if comuna_detectada != "[comuna]" and comuna_detectada != "(No identificado)": comuna_detectada = comuna_detectada.title()
+    if provincia_detectada != "[provincia]" and provincia_detectada != "(No identificado)": provincia_detectada = provincia_detectada.title()
 
     fecha_raw = DATA.get("fecha", "")
     try:
@@ -326,7 +305,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
     fuente_geo = PARAMS_TECNICOS.get("fuente_geo", "")
     
     lista_filtrada = [p for p in PERSONAL_CATASTRO if p["region"] in region_detectada or p["region"] == "Nivel Central"]
-
     opciones_html = ""
     mapa_cargos_js = ""
     for resp in lista_filtrada:
@@ -351,99 +329,36 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             .panel p + p {{ margin-top: 10px; }}
             .panel ul {{ margin-top: 10px; margin-bottom: 10px; padding-left: 30px; }}
             .panel li {{ margin-bottom: 5px; }}
-
-            /* Inputs modernos */
-            #encabezado_identificacion [contenteditable='true'] {{
-                color: #111; border: none; background: transparent;
-                padding: 0; border-radius: 0; display: inline; min-width: 50px; 
-            }}
-            [contenteditable='true'] {{
-                color: #666; border: 1px solid #ccc; background: #fff;
-                padding: 2px 4px; border-radius: 3px; display: inline-block; min-width: 150px; 
-            }}
+            #encabezado_identificacion [contenteditable='true'] {{ color: #111; border: none; background: transparent; padding: 0; border-radius: 0; display: inline; min-width: 50px; }}
+            [contenteditable='true'] {{ color: #666; border: 1px solid #ccc; background: #fff; padding: 2px 4px; border-radius: 3px; display: inline-block; min-width: 150px; }}
             [contenteditable='true']:focus {{ color: #111; border: 1px solid #003366; outline: none; background: #fff; }}
-            
-            #input_responsable {{
-                font-family: Calibri, Arial, sans-serif; font-size: 9pt;
-                border: 1px solid #ccc; background: #fff; padding: 2px 4px; border-radius: 3px;
-            }}
-            
+            #input_responsable {{ font-family: Calibri, Arial, sans-serif; font-size: 9pt; border: 1px solid #ccc; background: #fff; padding: 2px 4px; border-radius: 3px; }}
             button.main-btn {{background:#003366;color:#fff;border:none;padding:6px 12px;margin:8px 0;border-radius:4px;cursor:pointer;font-size:9pt;}}
             button.main-btn:hover {{background:#0059b3;}}
-            
-            /* --- DROP ZONE & IMAGENES --- */
             .image-block {{ margin-bottom: 20px; text-align: center; }}
-            
-            .drop-zone {{
-                display: block !important; 
-                width: 100%; 
-                min-height: 200px !important; 
-                height: auto;     
-                background: #fafafa;
-                border: 2px dashed #999; 
-                border-radius: 6px;
-                margin: 10px 0;
-                position: relative; 
-                cursor: pointer;
-                box-sizing: border-box;
-                padding: 10px;
-                text-align: center;
-            }}
-            
-            .drop-zone span.drop-text {{ 
-                display: inline-block; 
-                margin-top: 80px; 
-                color: #666; 
-                font-style: italic;
-                pointer-events: none; 
-            }}
-            
+            .drop-zone {{ display: block !important; width: 100%; min-height: 200px !important; height: auto; background: #fafafa; border: 2px dashed #999; border-radius: 6px; margin: 10px 0; position: relative; cursor: pointer; box-sizing: border-box; padding: 10px; text-align: center; }}
+            .drop-zone span.drop-text {{ display: inline-block; margin-top: 80px; color: #666; font-style: italic; pointer-events: none; }}
             .drop-zone:hover {{ background: #f0f0f0; border-color: #666; }}
             .drop-zone.dragover {{ background: #e8f5e9; border-color: #4caf50; }}
-            
-            .drop-zone canvas {{ 
-                max-width: 100%; 
-                height: auto; 
-                display: none; 
-                margin: 0 auto;
-            }}
-            
+            .drop-zone canvas {{ max-width: 100%; height: auto; display: none; margin: 0 auto; }}
             .drop-zone.has-image span.drop-text {{ display: none; }}
             .drop-zone.has-image canvas {{ display: block; }}
             .drop-zone.has-image {{ padding: 0; border-style: solid; }}
-
             .editor-toolbar {{ margin-top: 5px; text-align: center; display: none; }}
-            .editor-btn {{
-                background: #fff; border: 1px solid #ccc; color: #444;
-                padding: 4px 10px; border-radius: 4px; cursor: pointer; margin: 0 5px; font-size: 12pt;
-                line-height: 1;
-            }}
-
-            /* TABLAS */
+            .editor-btn {{ background: #fff; border: 1px solid #ccc; color: #444; padding: 4px 10px; border-radius: 4px; cursor: pointer; margin: 0 5px; font-size: 12pt; line-height: 1; }}
             table#tabla1, table#resumen, table#matriz {{ width: 100%; border-collapse:collapse; font-size:9pt; }}
             th,td{{border:1px solid #ccc;padding:4px 6px;text-align:left;vertical-align:middle;}}
             thead th{{background:#003366;color:#fff;text-align:center;}}
-            
-            /* Ancho de columnas Tabla 1 */
             #tabla1 td input, #tabla1 td select {{ width: 95%; box-sizing: border-box; font-family: Calibri, sans-serif; font-size: 9pt; }}
-            
-            /* INTERACTIVIDAD MATRIZ */
             .cat {{ background:#f0f0f0; font-weight:bold; user-select: text; }}
-            .toggle-indicator {{ 
-                font-family: monospace; font-weight: bold; float: right; margin-right: 5px; 
-                cursor: pointer; padding: 0 5px; background: #e0e0e0; border-radius: 3px; user-select: none; 
-            }}
+            .toggle-indicator {{ font-family: monospace; font-weight: bold; float: right; margin-right: 5px; cursor: pointer; padding: 0 5px; background: #e0e0e0; border-radius: 3px; user-select: none; }}
             .toggle-indicator:hover {{ background: #c0c0c0; }}
-
             #matriz th:nth-child(1), #matriz td:nth-child(1){{ width:18%; }}
             #matriz th:nth-child(2), #matriz td:nth-child(2){{ width:6%; }}
             #matriz th:nth-child(3), #matriz td:nth-child(3){{ width:53%; }} 
             #matriz th:nth-child(4), #matriz td:nth-child(4){{ width:23%; }} 
-
             .footer{{border-top:1px solid #ccc;margin-top:25px;padding-top:8px;font-size:8pt;color:#555;text-align:center;line-height:1.5;}}
             .fuente {{ font-style: italic; font-size: 9pt; color: #666; text-align: center; }}
-            
-            /* Encabezado MBN */
             .mbn-main-header-table {{ border: 1px solid #ccc; margin-bottom: 0; font-family: Calibri, sans-serif; }}
             .mbn-main-header-table tr, .mbn-main-header-table td {{ padding: 0 !important; border: none !important; vertical-align: top; }}
             .mbn-bar-cell {{ width: 2.4cm; min-width: 2.4cm; border-right: 1px solid #ccc !important; padding-right: 8px !important; }}
@@ -452,24 +367,11 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             .title-cell {{ padding-left: 8px !important; padding-top: 2px !important; padding-bottom: 4px !important; font-weight: bold; color:#003366; }}
             .mbn-bar-table {{ width: 2.4cm; border-collapse: collapse; table-layout: fixed; mso-table-lspace:0pt; mso-table-rspace:0pt; mso-padding-alt:0 0 0 0; margin: 0; }}
             .mbn-bar-table td {{ padding: 0 !important; border: none !important; line-height:0; font-size:1px; height: 0.23cm; }}
-            
-            /* Anexo Láminas */
-            .lamina-item {{ 
-                margin-bottom: 30px; 
-                border-bottom: 1px dashed #ccc; 
-                padding-bottom: 20px; 
-            }}
+            .lamina-item {{ margin-bottom: 30px; border-bottom: 1px dashed #ccc; padding-bottom: 20px; }}
             .lamina-item:last-child {{ border-bottom: none; }}
             .lamina-title {{ font-weight: bold; margin-bottom: 10px; text-align: center; }}
-            .btn-del-lamina {{ 
-                background: #ffdddd; border: 1px solid #ffaaaa; color: #aa0000; 
-                cursor: pointer; font-size: 8pt; padding: 2px 6px; margin-left: 10px; border-radius: 3px;
-            }}
-            
-            @media print {{
-                .actions, .editor-toolbar, .drop-text, button {{ display: none !important; }}
-                .drop-zone {{ border: none !important; min-height: 0 !important; }}
-            }}
+            .btn-del-lamina {{ background: #ffdddd; border: 1px solid #ffaaaa; color: #aa0000; cursor: pointer; font-size: 8pt; padding: 2px 6px; margin-left: 10px; border-radius: 3px; }}
+            @media print {{ .actions, .editor-toolbar, .drop-text, button {{ display: none !important; }} .drop-zone {{ border: none !important; min-height: 0 !important; }} }}
         </style>
         </head>
         <body>
@@ -660,14 +562,11 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                 this.initEvents();
             }
             initEvents() {
-                // Click event
                 this.dropZone.onclick = (e) => { 
                     if(e.target !== this.toolbar && !this.toolbar.contains(e.target)) { 
                         this.fileInput.click(); 
                     } 
                 };
-
-                // Drag events
                 this.dropZone.ondragover = (e) => { e.preventDefault(); this.dropZone.classList.add('dragover'); };
                 this.dropZone.ondragleave = () => { this.dropZone.classList.remove('dragover'); };
                 this.dropZone.ondrop = (e) => { 
@@ -675,8 +574,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                     this.dropZone.classList.remove('dragover'); 
                     if(e.dataTransfer.files && e.dataTransfer.files[0]) this.processFile(e.dataTransfer.files[0]); 
                 };
-
-                // Paste event (Ctrl+V)
                 this.container.addEventListener('paste', (e) => {
                     const items = (e.clipboardData || e.originalEvent.clipboardData).items;
                     for (let i = 0; i < items.length; i++) {
@@ -688,13 +585,9 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                         }
                     }
                 });
-
-                // File input event
                 this.fileInput.onchange = () => { 
                     if(this.fileInput.files[0]) this.processFile(this.fileInput.files[0]); 
                 };
-
-                // Button events
                 this.container.querySelector('.btn-rot-l').onclick = (e) => { e.stopPropagation(); this.rotate(-90); };
                 this.container.querySelector('.btn-rot-r').onclick = (e) => { e.stopPropagation(); this.rotate(90); };
                 this.container.querySelector('.btn-del').onclick = (e) => { e.stopPropagation(); this.clear(); };
@@ -703,7 +596,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                     if(this.imgObject.src && this.canvas.style.display !== 'none') this.render(); 
                 }).observe(this.dropZone);
             }
-
             processFile(file) {
                 if(!file.type.startsWith('image/')) return;
                 const reader = new FileReader();
@@ -788,7 +680,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             });
         }
 
-        // FIX: FUNCION AGREGAR CONCLUSION
         window.agregarConclusion = function() {
             var ul = document.getElementById("lista_conclusiones");
             if(!ul) return;
@@ -807,10 +698,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
         
         if(document.readyState==='complete') init(); else window.onload = init;
 
-        // ===============================================
-        // FUNCIONES DE UNIDAD Y SUPERFICIE 
-        // ===============================================
-        
         let currentUnit = 'm2'; 
 
         window.updateUnidadBase = function(input) {
@@ -899,7 +786,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             document.getElementById("fuente_imagen_1").innerText = targetU;
         };
 
-        // --- INTERACTIVIDAD MATRIZ ---
         window.toggleGroup = function(gName) {
             var cat = document.getElementById("cat-" + gName);
             if(!cat) return;
@@ -928,13 +814,8 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             }
         };
 
-        // =====================================================
-        // HELPER: CLONAR PRESERVANDO VALORES
-        // =====================================================
         function cloneWithValues(originalNode) {
             var clone = originalNode.cloneNode(true);
-            
-            // Sincronizar Inputs (saltando file inputs)
             var originalInputs = originalNode.querySelectorAll("input");
             var clonedInputs = clone.querySelectorAll("input");
             originalInputs.forEach((inp, i) => {
@@ -942,14 +823,11 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                     clonedInputs[i].value = inp.value; 
                 }
             });
-
-            // Sincronizar Selects
             var originalSelects = originalNode.querySelectorAll("select");
             var clonedSelects = clone.querySelectorAll("select");
             originalSelects.forEach((sel, i) => {
                 clonedSelects[i].selectedIndex = sel.selectedIndex; 
             });
-            
             return clone;
         }
 
@@ -1031,24 +909,19 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
             try {
                 var wrapper = document.createElement("div");
                 
-                // USO DE cloneWithValues
                 var enc = flatten(cloneWithValues(document.getElementById("encabezado_mbn"))); wrapper.append(enc);
                 var p = flatten(cloneWithValues(document.getElementById("parrafo_analisis"))); p.style.marginTop = "10px"; wrapper.append(p);
                 var t3 = document.createElement("h2"); t3.textContent="1. Antecedentes e identificación catastral territorial"; t3.style.color="#003366"; wrapper.append(t3);
                 wrapper.append(flatten(cloneWithValues(document.getElementById("antecedentes_panel"))));
                 var cap1 = document.createElement("div"); cap1.innerHTML="<i>Tabla N°1: Detalle Propiedad Fiscal en análisis.</i>"; cap1.style.cssText = "text-align:center;font-style:italic;margin:6px 0;"; wrapper.append(cap1);
                 
-                // Tabla 1 con valores
                 var t1 = cloneWithValues(document.getElementById("tabla1"));
                 var thS = t1.querySelector('#th-superficie');
                 if(thS) thS.innerHTML = 'Superficie UC (' + document.getElementById("unidad-display").textContent.trim() + ')';
                 wrapper.append(flatten(t1));
                 var f1 = document.createElement("div"); f1.innerText="Fuente: Sistema de Catastro, MBN."; f1.style.cssText="font-size:9pt; font-style:italic; color:#666; text-align:center;"; wrapper.append(f1);
 
-                // IMAGENES (FAKE URLS)
                 var mhtmlImages = [];
-
-                // Imagen 1
                 var img1Div = document.getElementById("bloque_imagen_1").cloneNode(true);
                 var canvas1 = document.querySelector("#bloque_imagen_1 canvas");
                 if(canvas1 && canvas1.width > 0 && canvas1.style.display !== 'none') {
@@ -1064,7 +937,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                 img1Div.querySelectorAll(".editor-toolbar").forEach(e => e.remove());
                 wrapper.append(flatten(img1Div));
 
-                // Resto
                 var t2 = document.createElement("h2"); t2.textContent="2. Análisis Territorial"; t2.style.color="#003366"; t2.style.marginTop="15px"; wrapper.append(t2);
                 wrapper.append(flatten(document.getElementById("intro_analisis").cloneNode(true)));
                 var cap2 = document.createElement("div"); cap2.innerHTML="<i>Tabla N° 2. Variables consideradas para el análisis territorial.</i>"; cap2.style.cssText = "text-align:center;font-style:italic;margin:12px 0 6px 0;"; wrapper.append(cap2);
@@ -1075,13 +947,11 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                 
                 var tC = document.createElement("h2"); tC.textContent="3. CONCLUSIONES"; tC.style.color="#003366"; wrapper.append(tC);
                 
-                // Conclusiones con cloneWithValues
                 wrapper.append(flatten(cloneWithValues(document.getElementById("conclusiones_panel"))));
                 
                 wrapper.append(flatten(cloneWithValues(document.getElementById("firma_panel"))));
                 wrapper.append(flatten(document.getElementById("word_footer").cloneNode(true)));
 
-                // Anexo con cloneWithValues
                 var tA = document.createElement("h2"); tA.textContent="ANEXO"; tA.style.color="#003366"; tA.style.textAlign="center"; wrapper.append(tA);
                 var anexoPanel = document.getElementById("anexo_panel").cloneNode(false); 
                 anexoPanel.style.textAlign = "center";
@@ -1105,7 +975,6 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
                 });
                 wrapper.append(anexoPanel);
 
-                // GENERAR MHTML
                 var css = "<style>body{font-family:Calibri,sans-serif;font-size:9pt;} h2{color:#003366;font-size:14pt;margin-top:20px;} p{text-align:justify; margin:0; margin-bottom:10px;} table{border-collapse:collapse;width:100%;} td,th{border:1px solid #ccc;padding:4px;} thead th{background:#003366;color:#fff;} .mbn-bar-table{width:2.4cm;border-collapse:collapse; table-layout:fixed;} .mbn-bar-table td{padding:0;border:none; line-height:normal;} .mbn-main-header-table{border:1px solid #ccc;margin-bottom:0;} .mbn-main-header-table tr, .mbn-main-header-table td{padding:0!important;border:none!important;vertical-align:top;} .mbn-bar-cell{width:2.4cm;min-width:2.4cm;border-right:1px solid #ccc!important;padding-right:8px!important;} .title-cell{padding-left:8px!important;padding-bottom:4px!important;font-weight:bold;color:#003366; padding-top: 2px !important;} #identificacion-content{padding-left:8px;font-size:9pt;} #identificacion-content table td{padding-top:4px!important; padding-bottom:4px!important;} .mbn-text-line-1, .mbn-text-line-2{font-size:9pt;} #parrafo_analisis{margin-top:10px;} @page Section1{margin:2cm 2.5cm; mso-header-margin:1.0cm; mso-footer-margin:1.0cm; mso-footer:f1;} div.Section1{page:Section1;} p.MsoFooter{text-align:right;font-size:9pt;} .lamina-item{page-break-inside: avoid; margin-bottom:20px;}</style>";
                 
                 var boundary = "----=_NextPart_000_0000";
@@ -1142,27 +1011,21 @@ def build_html(DATA, tabla_resumen, tabla_matriz):
     
     return textwrap.dedent(html_content) + textwrap.dedent(js_logic)
 
-# ===== MAIN (MODIFICADO) =====
+# ===== MAIN =====
 try:
     capa_base = detectar_capa_base()
     
-    # Detener ejecución si no hay capa base
     if not capa_base:
         raise Exception("No se pudo detectar la capa base en 'Deslinde MCT'. El script se detendrá.")
 
     DATA = build_data(capa_base)
-    
-    # Pasar la capa base a la función de clasificación
     clasificados = clasificar_capas(capa_base) 
-    
     tabla_resumen = construir_tabla_resumen(clasificados)
     tabla_matriz = construir_tabla_matriz(clasificados)
     html = build_html(DATA, tabla_resumen, tabla_matriz)
-    
     ruta = os.path.join(get_save_dir(capa_base), f"Minuta_{TITULO_ID}.html")
     with open(ruta, "w", encoding="utf-8") as f:
         f.write(html)
-    
     iface.messageBar().pushMessage("✅ Minuta Generada", f"Versión {TITULO_ID} guardada en: " + ruta, level=Qgis.Info, duration=7)
     webbrowser.open(ruta)
     print(f"[INFO] HTML abierto: {ruta}")
