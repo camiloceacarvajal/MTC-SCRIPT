@@ -1,0 +1,129 @@
+# MCT-SCRIPT-V1  
+Motor de análisis territorial + generación de Minuta Catastral Territorial (MBN)
+
+**Versión:** LTR-20-11-2025 – `MCT-SCRIPT-V1`  
+**Componentes:**
+- **Parte 1:** `LayerLoader` – Carga MCT, variables, layouts, intersecciones y leyendas en QGIS.
+- **Parte 2:** Generador de **Minuta Catastral Territorial** en HTML + exportación a Word (`.doc`).
+
+Este proyecto automatiza el flujo completo de trabajo de la Unidad de Catastro:
+
+1. Carga y normalización del polígono MCT (KML/KMZ/GPKG/SHP/GeoJSON).
+2. Carga de variables desde biblioteca de GeoPackage.
+3. Cruce de variables territoriales con la MCT.
+4. Preparación de layout estándar MBN desde plantilla QPT.
+5. Construcción de leyenda y visibilidad de capas relevantes.
+6. Generación de **Minuta Catastral Territorial** (HTML interactivo).
+7. Exportación a **Word (.doc)** listo para imprimir/archivar.
+
+---
+
+## 1. Requisitos
+
+### Software
+
+- **QGIS 3.x LTR** (probado en 3.40 LTR; se recomienda LTR vigente).
+- Módulos de QGIS:
+  - `qgis.core`
+  - `qgis.gui`
+  - `qgis.PyQt` (QtGui, QtWidgets, QtXml, QtCore)
+  - `processing` habilitado.
+
+### Python (dentro de QGIS)
+
+- `requests`
+- `pathlib.Path`
+- `os`, `re`, `unicodedata`, `tempfile`, `webbrowser`, `datetime`, `textwrap`, `collections.OrderedDict`
+
+### Infraestructura de datos
+
+- Proyecto QGIS con estructura de grupos esperada:
+  - `Deslinde MCT`
+  - `01. Contexto territorial` (contiene capa **Comunas**)
+  - `02. Instrumentos de Planificación Territorial`
+  - `03. Variables ambientales`
+  - `04. Variables de conservación`
+  - `05. Variables indígenas`
+  - `06. Variables de riesgo`
+  - `07. Variables de turismo y patrimonio`
+  - `08. Variables de minería`
+  - `09. Variables de energia`
+  - `00. Variables complementarias` (opcional, tratados distinto).
+- Bibliotecas de variables en formato **GPKG** (una carpeta por familia de variables).
+- Plantilla de layout QPT disponible en repositorio remoto:
+  - Ejemplo:
+    - `https://gitlab.com/camiloceacarvajal1/plantilla_MBN/-/raw/main/22.qpt?ref_type=heads`
+    - `https://raw.githubusercontent.com/camiloceacarvajal/PLANTILLA-MBN/main/21.qpt`
+
+---
+
+## 2. Estructura general del sistema
+
+### Parte 1: `LayerLoader` (motor geoespacial en QGIS)
+
+Clase principal que gestiona:
+
+- Carga y normalización del polígono MCT (KML, KMZ, GPKG, SHP, GeoJSON).
+- Carga de variables desde carpeta (biblioteca de GPKG).
+- Descarga y carga de plantilla QPT desde URLs.
+- Configuración de mapa principal, grilla, barras de escala y mapa de esquicio.
+- Cálculo de intersecciones entre MCT y todas las capas vectoriales del proyecto.
+- Actualización de leyenda para mostrar solo las capas relevantes.
+- Ajuste de renderers categorizados/graduados según selección.
+- Inserción de capas de fondo tipo XYZ (Google Satellite / NatGeo).
+
+**CRS de trabajo:** `EPSG:5361 – SIRGAS-Chile 2016 / UTM 19S`.
+
+### Parte 2: Generador de Minuta (HTML + Word)
+
+Script que:
+
+1. Detecta la capa base de MCT dentro del grupo `Deslinde MCT`.
+2. Obtiene región, provincia y comuna por intersección con `Comunas`.
+3. Clasifica las capas de variables por grupo (`00.`, `01.`, `02.`, etc.) y condición:
+   - `Superpone`
+   - `No superpone`
+4. Construye:
+   - **Tabla resumen numérica** por grupo.
+   - **Matriz detallada de variables** (expandible/plegable).
+5. Genera un **HTML interactivo** con:
+   - Encabezado MBN estandarizado.
+   - Textos base en estilo institucional.
+   - Tabla N° 1 editable (detalle de propiedad fiscal).
+   - Imagen N° 1 con editor (pegado, drag&drop, rotación).
+   - Conclusiones editables.
+   - Anexo con láminas (cada una con editor de imagen).
+   - Selección de responsable desde `PERSONAL_CATASTRO` filtrado por región.
+   - Bloque de firma simulada con QR (vCard) y CVD.
+6. Exporta a **Word (.doc)** mediante MHTML con imágenes embebidas.
+
+---
+
+## 3. Flujo de trabajo (usuario)
+
+### Paso a paso en QGIS
+
+1. **Preparar proyecto QGIS**
+   - Abrir QGIS.
+   - Cargar capas base (Comunas, variables, etc.) organizadas en los grupos mencionados.
+   - Verificar que exista el grupo `Deslinde MCT` (aunque inicialmente vacío).
+
+2. **Ejecutar la PARTE 1 en la consola de Python de QGIS**
+
+   - Pegar el código de la PARTE 1.
+   - Al final se ejecuta:
+
+   ```python
+   layer_loader = LayerLoader()
+   layer_loader.select_and_load_geopackage()
+   layer_loader.load_layers_from_selected_folder()
+   intersecting_layers = layer_loader.find_intersections_v5(['intersects'])
+   template_urls = [
+       "https://gitlab.com/camiloceacarvajal1/plantilla_MBN/-/raw/main/22.qpt?ref_type=heads",
+       "https://raw.githubusercontent.com/camiloceacarvajal/PLANTILLA-MBN/main/21.qpt"
+   ]
+   layer_loader.load_template_from_url(template_urls)
+   layer_loader.update_legend(intersecting_layers)
+   tile_layer_1, tile_layer_2 = layer_loader.add_tile_layers_to_project()
+   layer_loader.update_sketch_map(tile_layer_2)
+   ...
